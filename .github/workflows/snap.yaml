@@ -1,0 +1,117 @@
+name: Build Multi-Arch Snap and Release (Semantic)
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    
+    runs-on: ${{ matrix.runner }}
+    
+    steps:
+      - name: Checkout git repository
+        uses: actions/checkout@v4
+      
+      - name: Build the snap for ${{ matrix.arch }}
+        uses: snapcore/action-build@v1
+        id: snapcraft
+        with:
+          snapcraft-channel: 8.x/stable
+      
+      - name: Rename snap with architecture
+        run: |
+          SNAP_FILE="${{ steps.snapcraft.outputs.snap }}"
+          SNAP_NAME=$(basename "$SNAP_FILE" .snap)
+          mv "$SNAP_FILE" "${SNAP_NAME}_${{ matrix.arch }}.snap"
+          echo "snap_file=${SNAP_NAME}_${{ matrix.arch }}.snap" >> $GITHUB_OUTPUT
+        id: rename
+      
+      - name: Upload snap artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: snap-${{ matrix.arch }}
+          path: ${{ steps.rename.outputs.snap_file }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Get next semantic version
+        id: version
+        run: |
+          # Get the latest tag, or start with v0.0.0 if no tags exist
+          LATEST_TAG=$(git tag -l "v*" --sort=-version:refname | head -n1)
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG="v0.0.0"
+          fi
+          
+          # Increment patch version
+          MAJOR=$(echo $LATEST_TAG | cut -d. -f1 | sed 's/v//')
+          MINOR=$(echo $LATEST_TAG | cut -d. -f2)
+          PATCH=$(echo $LATEST_TAG | cut -d. -f3)
+          
+          NEW_PATCH=$((PATCH + 1))
+          NEW_VERSION="v${MAJOR}.${MINOR}.${NEW_PATCH}"
+          
+          echo "previous_version=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "Generated version: $NEW_VERSION (previous: $LATEST_TAG)"
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: "Release ${{ steps.version.outputs.version }}"
+          body: |
+            ## Multi-Architecture Snap Release ${{ steps.version.outputs.version }}
+            
+            **Previous Version:** ${{ steps.version.outputs.previous_version }}
+            **Commit:** ${{ github.sha }}
+            
+            ### Changes
+            This release includes the latest changes from the main branch.
+            
+            ### Architectures Available
+            - ✅ AMD64 (Intel/AMD 64-bit)
+            - ✅ ARM64 (Apple Silicon, ARM servers)
+            
+            ### Quick Install
+            ```bash
+            # For AMD64
+            curl -L -o app.snap "https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/$(ls ./artifacts/snap-amd64/*.snap | xargs basename)"
+            
+            # For ARM64  
+            curl -L -o app.snap "https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/$(ls ./artifacts/snap-arm64/*.snap | xargs basename)"
+            
+            sudo snap install --dangerous app.snap
+            ```
+          files: |
+            ./artifacts/snap-amd64/*.snap
+            ./artifacts/snap-arm64/*.snap
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
